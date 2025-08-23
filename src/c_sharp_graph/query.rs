@@ -577,4 +577,105 @@ mod tests {
         assert!(search3.parts[3].matches("Program2".to_string()));
         assert!(!search3.parts[3].matches("OtherClass".to_string()));
     }
+
+    #[test]
+    fn test_find_node_integration() {
+        // Test the integration between FindNode and the new search functionality
+        use crate::c_sharp_graph::find_node::FindNode;
+        
+        // Test that the regex pattern is passed through correctly
+        let find_node = FindNode {
+            node_type: None,
+            regex: "<a.b.c.Program*>".to_string(),
+        };
+        
+        // We can't easily test the full run() method without a database, 
+        // but we can test that the query parsing works
+        assert_eq!(find_node.regex, "<a.b.c.Program*>");
+        
+        // Verify that the Search parsing works correctly for this pattern
+        let search = Search::create_search(find_node.regex).unwrap();
+        assert_eq!(search.parts.len(), 4);
+        assert!(search.parts[3].matches("Program1".to_string()));
+        assert!(search.parts[3].matches("Program2".to_string()));
+        assert!(!search.parts[3].matches("OtherClass".to_string()));
+    }
+
+    #[test]
+    fn test_practical_example_scenarios() {
+        /*
+        Example C# code structure for context:
+        
+        namespace a.b.c {
+            public class Program { }     // Should match <a.b.c.Program>
+            public class Program1 { }    // Should match <a.b.c.Program*> 
+            public class Program2 { }    // Should match <a.b.c.Program*>
+            public class OtherClass { }  // Should NOT match Program patterns
+        }
+        
+        namespace a.something.c {
+            public class Program { }     // Should match <a.*.c.Program(*)>
+            public class Program3 { }    // Should match <a.*.c.Program(*)>
+        }
+        
+        namespace a.different.c {
+            public class Program { }     // Should match <a.*.c.Program(*)>
+        }
+        */
+        
+        // Test Pattern 1: <a.b.c.Program*> - Find all classes starting with "Program" in a.b.c
+        let search1 = Search::create_search("<a.b.c.Program*>".to_string()).unwrap();
+        assert!(search1.parts[3].matches("Program".to_string()));  // Exact match
+        assert!(search1.parts[3].matches("Program1".to_string())); // With suffix
+        assert!(search1.parts[3].matches("Program2".to_string())); // With suffix
+        assert!(!search1.parts[3].matches("OtherClass".to_string())); // Different class
+        
+        // Test Pattern 2: <a.b.c.Program> - Find exact Program class in a.b.c
+        let search2 = Search::create_search("<a.b.c.Program>".to_string()).unwrap();
+        assert!(search2.parts[3].matches("Program".to_string()));  // Exact match
+        assert!(!search2.parts[3].matches("Program1".to_string())); // No suffix allowed
+        assert!(!search2.parts[3].matches("Program2".to_string())); // No suffix allowed
+        
+        // Test Pattern 3: <a.*.c.Program(*)> - Find Program classes in a.*.c namespaces
+        let search3 = Search::create_search("<a.*.c.Program(*)>".to_string()).unwrap();
+        
+        // Test namespace matching - should match any middle namespace
+        assert!(search3.parts[1].matches("b".to_string()));         // a.b.c
+        assert!(search3.parts[1].matches("something".to_string())); // a.something.c
+        assert!(search3.parts[1].matches("different".to_string())); // a.different.c
+        
+        // Test class matching - should match Program with optional suffix
+        assert!(search3.parts[3].matches("Program".to_string()));   // Exact match
+        assert!(search3.parts[3].matches("Program3".to_string()));  // With suffix
+        assert!(!search3.parts[3].matches("OtherClass".to_string())); // Different class
+    }
+
+    #[test]
+    fn test_edge_cases_and_error_conditions() {
+        // Test empty brackets
+        let search_empty = Search::create_search("<>".to_string()).unwrap();
+        assert_eq!(search_empty.parts.len(), 1);
+        assert_eq!(search_empty.parts[0].part, "");
+        
+        // Test single element
+        let search_single = Search::create_search("<Program>".to_string()).unwrap();
+        assert_eq!(search_single.parts.len(), 1);
+        assert_eq!(search_single.parts[0].part, "Program");
+        
+        // Test without brackets (backwards compatibility)
+        let search_no_brackets = Search::create_search("a.b.c.Program*".to_string()).unwrap();
+        assert_eq!(search_no_brackets.parts.len(), 4);
+        assert_eq!(search_no_brackets.parts[3].part, "Program*");
+        assert!(search_no_brackets.parts[3].regex.is_some());
+        
+        // Test complex regex escaping
+        let search_special_chars = Search::create_search("<a.b.c.Program+Test*>".to_string()).unwrap();
+        assert_eq!(search_special_chars.parts.len(), 4);
+        assert_eq!(search_special_chars.parts[3].part, "Program+Test*");
+        assert!(search_special_chars.parts[3].regex.is_some());
+        
+        // The regex should properly escape the + character
+        assert!(search_special_chars.parts[3].matches("Program+Test123".to_string()));
+        assert!(!search_special_chars.parts[3].matches("ProgramXTest123".to_string()));
+    }
 }
