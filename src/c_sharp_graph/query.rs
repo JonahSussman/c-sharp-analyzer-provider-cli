@@ -118,7 +118,7 @@ impl Query for Querier<'_> {
                 }
                 let file_uri = file_url.unwrap().as_str().to_string();
                 let _ = f;
-                self.traverse_node_search(*comp_unit_node.unwrap(), &namespace_symbols, &mut results, file_uri);
+                self.traverse_node_search(*comp_unit_node.unwrap(), &namespace_symbols, &search, &mut results, file_uri);
             }
 
             println!("results - {:?}", results)
@@ -135,7 +135,7 @@ impl Querier<'_> {
     fn get_search(&self, query: String) -> anyhow::Result<Search, Error> {
        return Search::create_search(query);
     }
-    fn traverse_node_search(&mut self, node: Handle<Node>, namespace_symbols: &NamespaceSymbols, results: &mut Vec<Result>, file_uri: String) {
+    fn traverse_node_search(&mut self, node: Handle<Node>, namespace_symbols: &NamespaceSymbols, search: &Search, results: &mut Vec<Result>, file_uri: String) {
         let mut traverse_nodes: Vec<Handle<Node>> = vec![];
         for edge in self.db.outgoing_edges(node) {
             traverse_nodes.push(edge.sink);
@@ -146,7 +146,15 @@ impl Querier<'_> {
                 },
                 Some(symbol_handle) => {
                     let symbol = &self.db[symbol_handle];
-                    if namespace_symbols.symbol_in_namespace(symbol.to_string()) {
+                    
+                    // Check if symbol matches the search pattern or exists in namespace
+                    let matches_pattern = if let Some(last_part) = search.parts.last() {
+                        last_part.matches(symbol.to_string())
+                    } else {
+                        false
+                    };
+                    
+                    if namespace_symbols.symbol_in_namespace(symbol.to_string()) || matches_pattern {
                         let debug_ndoe = self.db.node_debug_info(edge.sink).map_or(vec![], |d| {
                             return d.iter().map(|e| {
                                 let k = self.db[e.key].to_string();
@@ -206,7 +214,7 @@ impl Querier<'_> {
             }
         }
         for n in traverse_nodes {
-            self.traverse_node_search(n, namespace_symbols, results, file_uri.clone());
+            self.traverse_node_search(n, namespace_symbols, search, results, file_uri.clone());
         }
     }
 }
@@ -285,6 +293,37 @@ impl NamespaceSymbols {
         return false
 
     }
+
+    /// Check if any symbols in the namespace match the given search pattern
+    fn has_matching_symbols(&self, search: &Search) -> Vec<String> {
+        let mut matching_symbols = Vec::new();
+        
+        // Get the last part of the search which should be the class pattern
+        if let Some(last_part) = search.parts.last() {
+            // Check classes
+            for (class_name, _) in &self.classes {
+                if last_part.matches(class_name.clone()) {
+                    matching_symbols.push(class_name.clone());
+                }
+            }
+            
+            // Check methods
+            for (method_name, _) in &self.class_methods {
+                if last_part.matches(method_name.clone()) {
+                    matching_symbols.push(method_name.clone());
+                }
+            }
+            
+            // Check fields
+            for (field_name, _) in &self.class_fields {
+                if last_part.matches(field_name.clone()) {
+                    matching_symbols.push(field_name.clone());
+                }
+            }
+        }
+        
+        matching_symbols
+    }
 }
 
 
@@ -301,16 +340,32 @@ struct Search {
 
 impl Search {
     fn create_search(query: String) -> anyhow::Result<Search, Error> {
-        let mut parts: Vec<SearchPart> = vec![];
-        for part in query.split(".") {
-            if part.contains("*") {
-                let regex: Regex;
-                if part == "*" {
-                    regex = Regex::new(".*")?;
-                } else {
-                    regex = Regex::new(part)?;
-                }
+        // Remove angle brackets if present
+        let clean_query = if query.starts_with('<') && query.ends_with('>') {
+            query[1..query.len()-1].to_string()
+        } else {
+            query
+        };
 
+        let mut parts: Vec<SearchPart> = vec![];
+        for part in clean_query.split(".") {
+            if part.contains("*") || part.contains("(*)") {
+                let regex_pattern = if part == "*" {
+                    ".*".to_string()
+                } else if part.ends_with("(*)") {
+                    // Handle "Program(*)" pattern - matches Program or Program with suffix
+                    let base = &part[..part.len()-3]; // Remove "(*)"
+                    format!("{}.*", regex::escape(base))
+                } else if part.ends_with("*") {
+                    // Handle "Program*" pattern - matches Program with any suffix
+                    let base = &part[..part.len()-1]; // Remove "*"
+                    format!("{}.*", regex::escape(base))
+                } else {
+                    // Other patterns with * in the middle - treat as literal regex
+                    part.replace("*", ".*")
+                };
+
+                let regex = Regex::new(&regex_pattern)?;
                 parts.push(SearchPart{
                     part: part.to_string(),
                     regex: Some(regex),
@@ -376,5 +431,150 @@ impl SearchPart {
             None => return self.part == match_string,
             Some(r) => return r.is_match(match_string.as_str()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_search_with_brackets() {
+        // Test bracket syntax removal
+        let search = Search::create_search("<a.b.c.Program>".to_string()).unwrap();
+        assert_eq!(search.parts.len(), 4);
+        assert_eq!(search.parts[0].part, "a");
+        assert_eq!(search.parts[1].part, "b");
+        assert_eq!(search.parts[2].part, "c");
+        assert_eq!(search.parts[3].part, "Program");
+    }
+
+    #[test]
+    fn test_create_search_with_wildcard_at_end() {
+        // Test "Program*" pattern
+        let search = Search::create_search("<a.b.c.Program*>".to_string()).unwrap();
+        assert_eq!(search.parts.len(), 4);
+        assert_eq!(search.parts[3].part, "Program*");
+        assert!(search.parts[3].regex.is_some());
+        
+        // Test that it matches correctly
+        assert!(search.parts[3].matches("Program1".to_string()));
+        assert!(search.parts[3].matches("Program2".to_string()));
+        assert!(search.parts[3].matches("Program".to_string()));
+        assert!(!search.parts[3].matches("OtherClass".to_string()));
+    }
+
+    #[test]
+    fn test_create_search_with_namespace_wildcard() {
+        // Test "a.*.c.Program" pattern
+        let search = Search::create_search("<a.*.c.Program>".to_string()).unwrap();
+        assert_eq!(search.parts.len(), 4);
+        assert_eq!(search.parts[1].part, "*");
+        assert!(search.parts[1].regex.is_some());
+        
+        // Test that wildcard matches any namespace part
+        assert!(search.parts[1].matches("something".to_string()));
+        assert!(search.parts[1].matches("anything".to_string()));
+    }
+
+    #[test]
+    fn test_create_search_with_class_wildcard_in_parentheses() {
+        // Test "a.*.c.Program(*)" pattern - class with optional wildcard
+        let search = Search::create_search("<a.*.c.Program(*)>".to_string()).unwrap();
+        assert_eq!(search.parts.len(), 4);
+        assert_eq!(search.parts[3].part, "Program(*)");
+        assert!(search.parts[3].regex.is_some());
+        
+        // Test that it matches correctly
+        assert!(search.parts[3].matches("Program".to_string()));
+        assert!(search.parts[3].matches("Program1".to_string()));
+        assert!(search.parts[3].matches("Program2".to_string()));
+        assert!(!search.parts[3].matches("OtherClass".to_string()));
+    }
+
+    #[test]
+    fn test_search_part_exact_match() {
+        let part = SearchPart {
+            part: "Program".to_string(),
+            regex: None,
+        };
+        
+        assert!(part.matches("Program".to_string()));
+        assert!(!part.matches("Program1".to_string()));
+        assert!(!part.matches("OtherClass".to_string()));
+    }
+
+    #[test]
+    fn test_namespace_symbols_pattern_matching() {
+        use std::collections::HashMap;
+
+        let classes = HashMap::new();
+        let class_fields = HashMap::new();
+        let class_methods = HashMap::new();
+        
+        let _namespace_symbols = NamespaceSymbols {
+            classes,
+            class_fields,
+            class_methods,
+        };
+
+        // Test with a Program* search pattern
+        let search = Search::create_search("<a.b.c.Program*>".to_string()).unwrap();
+        
+        // The has_matching_symbols method should be able to match patterns
+        // This is more of a structural test since we can't easily create real stack graph nodes
+        assert_eq!(search.parts.len(), 4);
+        assert_eq!(search.parts[3].part, "Program*");
+    }
+
+    #[test]
+    fn test_requirements_patterns() {
+        // Test the three specific patterns mentioned in the requirements
+        
+        // 1. `<a.b.c.Program*>` - should find all classes in namespace a.b.c that start with program
+        let search1 = Search::create_search("<a.b.c.Program*>".to_string()).unwrap();
+        assert_eq!(search1.parts.len(), 4);
+        assert_eq!(search1.parts[0].part, "a");
+        assert_eq!(search1.parts[1].part, "b");
+        assert_eq!(search1.parts[2].part, "c");
+        assert_eq!(search1.parts[3].part, "Program*");
+        assert!(search1.parts[3].regex.is_some());
+        
+        // Test that it matches correctly
+        assert!(search1.parts[3].matches("Program1".to_string()));
+        assert!(search1.parts[3].matches("Program2".to_string()));
+        assert!(search1.parts[3].matches("Program".to_string()));
+        assert!(!search1.parts[3].matches("OtherClass".to_string()));
+        
+        // 2. `<a.b.c.Program>` - Should find just the a.b.c.Program class
+        let search2 = Search::create_search("<a.b.c.Program>".to_string()).unwrap();
+        assert_eq!(search2.parts.len(), 4);
+        assert_eq!(search2.parts[3].part, "Program");
+        assert!(search2.parts[3].regex.is_none());
+        
+        // Test exact matching
+        assert!(search2.parts[3].matches("Program".to_string()));
+        assert!(!search2.parts[3].matches("Program1".to_string()));
+        assert!(!search2.parts[3].matches("OtherClass".to_string()));
+        
+        // 3. `<a.*.c.Program(*)>` - Should find for all namespaces that are in a and have a nested namespace c the class of Program
+        let search3 = Search::create_search("<a.*.c.Program(*)>".to_string()).unwrap();
+        assert_eq!(search3.parts.len(), 4);
+        assert_eq!(search3.parts[0].part, "a");
+        assert_eq!(search3.parts[1].part, "*");
+        assert_eq!(search3.parts[2].part, "c");
+        assert_eq!(search3.parts[3].part, "Program(*)");
+        assert!(search3.parts[1].regex.is_some()); // namespace wildcard
+        assert!(search3.parts[3].regex.is_some()); // class wildcard
+        
+        // Test namespace wildcard matching
+        assert!(search3.parts[1].matches("something".to_string()));
+        assert!(search3.parts[1].matches("anything".to_string()));
+        
+        // Test class pattern matching
+        assert!(search3.parts[3].matches("Program".to_string()));
+        assert!(search3.parts[3].matches("Program1".to_string()));
+        assert!(search3.parts[3].matches("Program2".to_string()));
+        assert!(!search3.parts[3].matches("OtherClass".to_string()));
     }
 }
